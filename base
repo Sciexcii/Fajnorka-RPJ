@@ -1,0 +1,1650 @@
+from __future__ import annotations
+
+import os
+import math
+import time
+import json
+import random
+import platform
+import shutil
+from dataclasses import dataclass, asdict
+from typing import Dict, Optional, Tuple, List, Any
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+# Optional plotting
+try:
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except Exception:
+    HAS_MPL = False
+
+
+# ============================================================
+# VERSION
+# ============================================================
+VERSION_TAG = "phasetropy_materials_v9_scenarios_time_sliced_tracking_lbfgs"
+print(f"RUNNING VERSION: {VERSION_TAG}")
+
+
+# ============================================================
+# Logger
+# ============================================================
+class Logger:
+    def __init__(self, out_dir: str, run_name: str):
+        self.out_dir = out_dir
+        self.run_name = run_name
+        os.makedirs(out_dir, exist_ok=True)
+        self.meta: Dict[str, Any] = {}
+        self.rows: List[Dict[str, float]] = []
+        self.t0 = time.time()
+
+    def log_meta(self, k: str, v: Any) -> None:
+        self.meta[k] = v
+
+    def log_row(self, row: Dict[str, float]) -> None:
+        self.rows.append(row)
+
+    def save(self) -> None:
+        self.meta["runtime_sec"] = float(time.time() - self.t0)
+        with open(os.path.join(self.out_dir, f"{self.run_name}_meta.json"), "w") as f:
+            json.dump(self.meta, f, indent=2)
+
+        if self.rows:
+            keys = sorted(self.rows[0].keys())
+            with open(os.path.join(self.out_dir, f"{self.run_name}_log.csv"), "w") as f:
+                f.write(",".join(keys) + "\n")
+                for r in self.rows:
+                    f.write(",".join(str(float(r.get(k, 0.0))) for k in keys) + "\n")
+
+
+# ============================================================
+# Repro / speed
+# ============================================================
+def configure_torch_for_speed(seed: int = 1234, deterministic: bool = False) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = not deterministic
+
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+
+def get_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def logit(p: float) -> float:
+    p = min(max(p, 1e-6), 1.0 - 1e-6)
+    return float(math.log(p / (1.0 - p)))
+
+
+# ============================================================
+# torch.compile safety (Windows cl.exe)
+# ============================================================
+def _has_msvc_cl() -> bool:
+    return shutil.which("cl") is not None
+
+
+def can_use_torch_compile() -> Tuple[bool, str]:
+    if not hasattr(torch, "compile"):
+        return False, "torch.compile not available"
+    if os.name == "nt" and not _has_msvc_cl():
+        return False, "Windows detected but MSVC cl.exe not found (torch.compile/inductor would fail)"
+    return True, "ok"
+
+
+def maybe_compile(model: nn.Module, enabled: bool) -> nn.Module:
+    if not enabled:
+        return model
+    ok, reason = can_use_torch_compile()
+    if not ok:
+        print(f"[compile] Disabled: {reason}")
+        return model
+    try:
+        return torch.compile(model)
+    except Exception as e:
+        print(f"[compile] Failed -> eager fallback. {type(e).__name__}: {e}")
+        return model
+
+
+# ============================================================
+# AMP helpers
+# ============================================================
+class NullScaler:
+    def scale(self, loss: torch.Tensor) -> torch.Tensor:
+        return loss
+
+    def unscale_(self, optimizer: optim.Optimizer) -> None:
+        return None
+
+    def step(self, optimizer: optim.Optimizer) -> None:
+        optimizer.step()
+
+    def update(self) -> None:
+        return None
+
+
+def make_scaler(device: torch.device, enabled: bool) -> Any:
+    if device.type == "cuda" and enabled:
+        return torch.amp.GradScaler("cuda", enabled=True)
+    return NullScaler()
+
+
+def autocast_ctx(device: torch.device, enabled: bool, dtype: torch.dtype):
+    from contextlib import nullcontext
+    if device.type == "cuda" and enabled:
+        return torch.amp.autocast("cuda", enabled=True, dtype=dtype)
+    return nullcontext()
+
+
+def compute_gpu_mem_gb() -> float:
+    if not torch.cuda.is_available():
+        return 0.0
+    return float(torch.cuda.max_memory_allocated() / (1024 ** 3))
+
+
+# ============================================================
+# Configs
+# ============================================================
+@dataclass
+class PhysicsConfig:
+    dim: int = 2
+    bc_type: str = "robin"              # "dirichlet"|"neumann"|"robin"
+    use_sources: bool = True
+
+    # phase_mode: "none" | "pcm_equilibrium" | "damage"
+    # - Only "pcm_equilibrium" contributes latent in the PDE.
+    phase_mode: str = "none"
+    phase_beta: float = 18.0
+    phase_smooth_grad_w: float = 0.02
+
+    # control (boundary flux correction)
+    use_control: bool = True
+    control_boundary: bool = True
+    control_budget_q: float = 0.06
+
+    # setpoint definition for mean-based control metrics
+    # "constant" uses Targets.T_set
+    # "ambient" uses T_inf(t) (matches boundary ambient)
+    track_setpoint_mode: str = "ambient"
+
+    # mean-based tracking (recommended)
+    track_mean_temperature: bool = True
+
+
+@dataclass
+class NondimConfig:
+    L0: float = 0.01
+    dT: float = 200.0
+    Tref: float = 300.0
+    k_ref: float = 200.0
+    rho_ref: float = 2700.0
+    C_ref: float = 900.0
+
+
+@dataclass
+class Targets:
+    T_set: float = 0.2
+    band_frac: float = 0.05
+    frac_in_band_target: float = 0.80
+    rmse_set_target: float = 0.03
+
+    E1rms_target: float = 0.10
+
+    sps_target: float = 1500.0
+    mem_gb_target: float = 6.0
+
+    entropy_target: float = 0.5
+    CV_T_target: float = 0.10
+    grad_rms_target: float = 2.0
+    dissipation_target: float = 0.25
+
+    latent_ratio_target: float = 0.20
+    latent_ratio_sigma: float = 0.15
+
+    eta_total_control_target: float = 0.70
+    eta_total_sim_target: float = 0.70
+
+
+@dataclass
+class TrainConfig:
+    seed: int = 1234
+    epochs: int = 2500
+    lr: float = 3e-4
+    weight_decay: float = 1e-8
+
+    # Universal PINN should train on coherent "scenarios":
+    # each scenario = one material vector shared across many collocation points.
+    n_scenarios: int = 4
+
+    n_interior: int = 4096
+    n_boundary: int = 1024
+    n_initial: int = 1024
+
+    # Stage split
+    stage1_frac: float = 0.45
+    reg_ramp_epochs: int = 400  # ramp regulation weights after stage1
+
+    # Loss weights
+    w_pde: float = 1.0
+    w_bc: float = 6.0
+    w_ic: float = 8.0
+
+    w_phase: float = 0.12
+    w_entropy: float = 0.02
+    w_bounds: float = 0.05
+    w_priors: float = 0.03
+
+    # Regulation weights (applied on time-sliced means)
+    w_track: float = 18.0
+    w_band: float = 25.0
+    w_uniformity: float = 1.0
+    w_ctrl: float = 0.15
+
+    grad_clip: float = 1.0
+
+    # Curriculum for PDE
+    curriculum: bool = True
+    curriculum_epochs: int = 600
+
+    # RAR
+    use_rar: bool = True
+    rar_pool: int = 16000
+    rar_every: int = 200
+    rar_top_frac: float = 0.35
+
+    # time-sliced tracking batch (per scenario)
+    n_track_space: int = 256
+    track_times: Tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0)
+
+    # AMP / compile
+    use_amp: bool = True
+    amp_dtype: str = "bf16"
+    compile_model: bool = True
+    deterministic: bool = False
+
+    # Scheduler
+    use_scheduler: bool = True
+    sched_patience: int = 6
+    sched_factor: float = 0.5
+    sched_min_lr: float = 5e-6
+
+    # L-BFGS refinement (helps push E1_rms below target)
+    use_lbfgs_refine: bool = True
+    lbfgs_steps: int = 80
+
+    # Early stop
+    early_stop: bool = True
+    early_stop_min_epoch: int = 900
+    early_stop_patience_logs: int = 4
+
+    # Logging
+    log_every: int = 200
+    out_dir: str = "runs_unified"
+    run_name: str = "phasetropy_v9"
+
+
+@dataclass
+class NetConfig:
+    use_fourier_features: bool = True
+    fourier_dim: int = 48
+    fourier_scale: float = 8.0
+    hidden: int = 128
+    depth: int = 6
+    dropout: float = 0.0
+
+
+@dataclass
+class MaterialConfig:
+    group_name: str = "metals"  # "metals"|"pcm"
+    use_microstructure: bool = True
+    base_vec_dim: int = 12
+    micro_vec_dim: int = 6
+
+
+# ============================================================
+# Nondimensionalization
+# ============================================================
+class Nondim:
+    def __init__(self, cfg: NondimConfig):
+        self.cfg = cfg
+        self.alpha_ref = cfg.k_ref / (cfg.rho_ref * cfg.C_ref)
+        self.t0 = (cfg.L0 ** 2) / self.alpha_ref
+
+    def T_phys(self, T_star: torch.Tensor) -> torch.Tensor:
+        return self.cfg.Tref + self.cfg.dT * T_star
+
+
+# ============================================================
+# Material priors + effective medium
+# ============================================================
+class MaterialPriors:
+    def __init__(self, group: str):
+        self.group = group.lower()
+
+    def sample_base(self, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        g = self.group
+        if g == "pcm":
+            k0 = torch.empty(n, 1, device=device, dtype=dtype).uniform_(0.1, 5.0)
+            kT = torch.empty(n, 1, device=device, dtype=dtype).uniform_(-0.3, 0.3)
+            C0 = torch.empty(n, 1, device=device, dtype=dtype).uniform_(1200, 3000)
+            rho0 = torch.empty(n, 1, device=device, dtype=dtype).uniform_(700, 2000)
+            L = torch.empty(n, 1, device=device, dtype=dtype).uniform_(1e5, 4e5)
+            Tm = torch.empty(n, 1, device=device, dtype=dtype).uniform_(290, 380)
+            G = torch.zeros(n, 1, device=device, dtype=dtype)
+            tau_q = torch.zeros(n, 1, device=device, dtype=dtype)
+            ell_q = torch.zeros(n, 1, device=device, dtype=dtype)
+            h = torch.empty(n, 1, device=device, dtype=dtype).uniform_(5, 500)
+            eps = torch.empty(n, 1, device=device, dtype=dtype).uniform_(0.2, 0.95)
+            hK = torch.empty(n, 1, device=device, dtype=dtype).uniform_(1e3, 1e7)
+        elif g == "metals":
+            k0 = torch.empty(n, 1, device=device, dtype=dtype).uniform_(80, 400)
+            kT = torch.empty(n, 1, device=device, dtype=dtype).uniform_(-0.2, 0.2)
+            C0 = torch.empty(n, 1, device=device, dtype=dtype).uniform_(300, 900)
+            rho0 = torch.empty(n, 1, device=device, dtype=dtype).uniform_(2500, 9000)
+            # metals: default no latent
+            L = torch.zeros(n, 1, device=device, dtype=dtype)
+            Tm = torch.empty(n, 1, device=device, dtype=dtype).uniform_(800, 1400)
+            G = torch.zeros(n, 1, device=device, dtype=dtype)
+            tau_q = torch.zeros(n, 1, device=device, dtype=dtype)
+            ell_q = torch.zeros(n, 1, device=device, dtype=dtype)
+            h = torch.empty(n, 1, device=device, dtype=dtype).uniform_(10, 2000)
+            eps = torch.empty(n, 1, device=device, dtype=dtype).uniform_(0.05, 0.95)
+            hK = torch.empty(n, 1, device=device, dtype=dtype).uniform_(1e4, 1e8)
+        else:
+            k0 = torch.empty(n, 1, device=device, dtype=dtype).uniform_(0.1, 200)
+            kT = torch.empty(n, 1, device=device, dtype=dtype).uniform_(-0.2, 0.2)
+            C0 = torch.empty(n, 1, device=device, dtype=dtype).uniform_(300, 2500)
+            rho0 = torch.empty(n, 1, device=device, dtype=dtype).uniform_(800, 9000)
+            L = torch.empty(n, 1, device=device, dtype=dtype).uniform_(0.0, 4e5)
+            Tm = torch.empty(n, 1, device=device, dtype=dtype).uniform_(300, 1400)
+            G = torch.zeros(n, 1, device=device, dtype=dtype)
+            tau_q = torch.zeros(n, 1, device=device, dtype=dtype)
+            ell_q = torch.zeros(n, 1, device=device, dtype=dtype)
+            h = torch.empty(n, 1, device=device, dtype=dtype).uniform_(2, 1000)
+            eps = torch.empty(n, 1, device=device, dtype=dtype).uniform_(0.05, 0.95)
+            hK = torch.empty(n, 1, device=device, dtype=dtype).uniform_(1e3, 1e7)
+
+        return torch.cat([k0, kT, C0, rho0, L, Tm, G, tau_q, ell_q, h, eps, hK], dim=1)
+
+    def sample_micro(self, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        # [filler_fraction, porosity, aspect, orient, dispersion, Rint]
+        f = torch.empty(n, 1, device=device, dtype=dtype).uniform_(0.0, 0.35)
+        por = torch.empty(n, 1, device=device, dtype=dtype).uniform_(0.0, 0.4)
+        aspect = torch.empty(n, 1, device=device, dtype=dtype).uniform_(1.0, 200.0)
+        orient = torch.empty(n, 1, device=device, dtype=dtype).uniform_(0.0, 1.0)
+        disp = torch.empty(n, 1, device=device, dtype=dtype).uniform_(0.2, 1.0)
+        Rint = torch.empty(n, 1, device=device, dtype=dtype).uniform_(1e-9, 1e-7)
+        return torch.cat([f, por, aspect, orient, disp, Rint], dim=1)
+
+
+class EffectiveMedium:
+    def k_eff(self, k_matrix: torch.Tensor, k_filler: torch.Tensor, micro: torch.Tensor) -> torch.Tensor:
+        f = micro[:, 0:1].clamp(0.0, 0.8)
+        por = micro[:, 1:2].clamp(0.0, 0.9)
+        aspect = micro[:, 2:3].clamp(1.0, 1e4)
+        orient = micro[:, 3:4].clamp(0.0, 1.0)
+        disp = micro[:, 4:5].clamp(0.0, 1.0)
+        Rint = micro[:, 5:6].clamp(1e-12, 1e-4)
+
+        shape_boost = 1.0 + 0.3 * torch.tanh((aspect - 1.0) / 50.0) * orient
+        disp_boost = 0.7 + 0.3 * disp
+        kf_eff = k_filler / (1.0 + 1e7 * Rint)
+
+        num = k_matrix * (kf_eff + 2 * k_matrix + 2 * f * (kf_eff - k_matrix))
+        den = (kf_eff + 2 * k_matrix - f * (kf_eff - k_matrix)).clamp(min=1e-12)
+        k_mg = num / den
+
+        f0 = 0.15 / shape_boost.clamp(min=0.5, max=3.0)
+        s = torch.sigmoid(30.0 * (f - f0))
+        k_perc = k_matrix * (1.0 + 20.0 * (f**1.5) * shape_boost * disp_boost)
+
+        k_mix = (1 - s) * k_mg + s * k_perc
+        return k_mix * (1.0 - por).clamp(min=0.05)
+
+
+class MaterialModel:
+    def __init__(self, cfg: MaterialConfig, nd: Nondim, device: torch.device, dtype: torch.dtype):
+        self.cfg = cfg
+        self.nd = nd
+        self.device = device
+        self.dtype = dtype
+        self.priors = MaterialPriors(cfg.group_name)
+        self.em = EffectiveMedium()
+        self.k_filler_typ = 2000.0 if cfg.group_name.lower() in ("pcm", "polymers") else 500.0
+
+    def sample_material_vector(self, n: int) -> torch.Tensor:
+        base = self.priors.sample_base(n, self.device, self.dtype)
+        if self.cfg.use_microstructure:
+            micro = self.priors.sample_micro(n, self.device, self.dtype)
+            return torch.cat([base, micro], dim=1)
+        return base
+
+    def split_vec(self, mvec: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        base = mvec[:, : self.cfg.base_vec_dim]
+        micro = None
+        if self.cfg.use_microstructure:
+            micro = mvec[:, self.cfg.base_vec_dim:self.cfg.base_vec_dim + self.cfg.micro_vec_dim]
+        return base, micro
+
+    def _k_phys(self, T_phys: torch.Tensor, base: torch.Tensor, micro: Optional[torch.Tensor], phi: Optional[torch.Tensor], nd_cfg: NondimConfig) -> torch.Tensor:
+        k0 = base[:, 0:1]
+        kT = base[:, 1:2]
+        dT = (T_phys - nd_cfg.Tref) / max(nd_cfg.dT, 1e-12)
+        k_matrix = (k0 * (1.0 + kT * dT)).clamp(min=1e-6)
+
+        # phi reduces k (interpretable melt fraction or damage)
+        if phi is not None:
+            k_matrix = k_matrix * (1.0 - 0.35 * phi.clamp(0.0, 1.0))
+
+        if micro is not None:
+            k_filler = torch.full_like(k_matrix, float(self.k_filler_typ))
+            return self.em.k_eff(k_matrix, k_filler, micro)
+        return k_matrix
+
+    def _C_phys(self, T_phys: torch.Tensor, base: torch.Tensor, phi: Optional[torch.Tensor], nd_cfg: NondimConfig) -> torch.Tensor:
+        C0 = base[:, 2:3]
+        dT = (T_phys - nd_cfg.Tref) / max(nd_cfg.dT, 1e-12)
+        C = C0 * (1.0 + 0.05 * torch.tanh(dT))
+        if phi is not None:
+            C = C * (1.0 + 0.10 * phi.clamp(0.0, 1.0))
+        return C.clamp(min=1e-6)
+
+    def eval(self, T_star: torch.Tensor, phi: Optional[torch.Tensor], mvec: torch.Tensor, nd_cfg: NondimConfig) -> Dict[str, torch.Tensor]:
+        base, micro = self.split_vec(mvec)
+        T_phys = self.nd.T_phys(T_star)
+
+        L_phys = base[:, 4:5].clamp(min=0.0)
+        Tm_phys = base[:, 5:6].clamp(min=1.0)
+
+        tau_q_phys = base[:, 7:8].clamp(min=0.0)
+        ell_q_phys = base[:, 8:9].clamp(min=0.0)
+
+        h_phys = base[:, 9:10].clamp(min=0.0)
+        eps = base[:, 10:11].clamp(0.0, 1.0)
+        hK_phys = base[:, 11:12].clamp(min=1.0)
+
+        k_phys = self._k_phys(T_phys, base, micro, phi, nd_cfg)
+        C_phys = self._C_phys(T_phys, base, phi, nd_cfg)
+
+        C_hat = C_phys / nd_cfg.C_ref
+        K_star = k_phys / nd_cfg.k_ref
+
+        Ste = (nd_cfg.C_ref * nd_cfg.dT) / (L_phys + 1e-12)
+        Ste = Ste.clamp(min=1e-6, max=1e12)
+
+        Theta_q = tau_q_phys / (self.nd.t0 + 1e-12)
+        Lambda_q = ell_q_phys / (nd_cfg.L0 + 1e-12)
+
+        Bi_c = h_phys * nd_cfg.L0 / (nd_cfg.k_ref + 1e-12)
+        Bi_K = hK_phys * nd_cfg.L0 / (nd_cfg.k_ref + 1e-12)
+
+        return {
+            "C_hat": C_hat,
+            "K_star": K_star,
+            "Ste": Ste,
+            "Theta_q": Theta_q,
+            "Lambda_q": Lambda_q,
+            "Bi_c": Bi_c,
+            "Bi_K": Bi_K,
+            "eps": eps,
+            "Tm_star": (Tm_phys - nd_cfg.Tref) / nd_cfg.dT,
+        }
+
+
+# ============================================================
+# Networks
+# ============================================================
+def sigmoid01(x: torch.Tensor) -> torch.Tensor:
+    return torch.sigmoid(x)
+
+
+class FourierFeatures(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, scale: float, device: torch.device, dtype: torch.dtype):
+        super().__init__()
+        B = torch.randn(in_dim, out_dim, device=device, dtype=dtype) * scale
+        self.register_buffer("B", B)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_proj = 2 * math.pi * (x @ self.B)
+        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+
+
+class MLP(nn.Module):
+    def __init__(self, in_dim: int, hidden: int, depth: int, out_dim: int, dropout: float = 0.0):
+        super().__init__()
+        layers: List[nn.Module] = []
+        d = in_dim
+        for _ in range(depth):
+            layers += [nn.Linear(d, hidden), nn.Tanh()]
+            if dropout > 0:
+                layers.append(nn.Dropout(p=dropout))
+            d = hidden
+        layers.append(nn.Linear(d, out_dim))
+        self.net = nn.Sequential(*layers)
+        self._init()
+
+    def _init(self) -> None:
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                nn.init.constant_(m.bias, 0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class MultiFieldPINN(nn.Module):
+    """
+    Outputs:
+      - T in [0,1]
+      - phi in [0,1] if phase_mode != "none"
+    """
+    def __init__(self, dim: int, mat_dim: int, net_cfg: NetConfig, physics: PhysicsConfig, device: torch.device, dtype: torch.dtype):
+        super().__init__()
+        self.dim = dim
+        self.physics = physics
+
+        in_dim = (dim + 1) + mat_dim
+        self.ff: Optional[FourierFeatures] = None
+        if net_cfg.use_fourier_features:
+            self.ff = FourierFeatures(in_dim, net_cfg.fourier_dim, net_cfg.fourier_scale, device=device, dtype=dtype)
+            trunk_in = 2 * net_cfg.fourier_dim
+        else:
+            trunk_in = in_dim
+
+        self.trunk = MLP(trunk_in, net_cfg.hidden, net_cfg.depth, net_cfg.hidden, dropout=net_cfg.dropout)
+        self.head_T = nn.Linear(net_cfg.hidden, 1)
+        self.head_phi = None if physics.phase_mode.lower() == "none" else nn.Linear(net_cfg.hidden, 1)
+
+        nn.init.xavier_uniform_(self.head_T.weight, gain=1.0)
+        nn.init.constant_(self.head_T.bias, logit(0.2))
+
+        if self.head_phi is not None:
+            nn.init.xavier_uniform_(self.head_phi.weight, gain=1.0)
+            nn.init.constant_(self.head_phi.bias, logit(1e-4))
+
+    def forward(self, X: torch.Tensor, mvec: torch.Tensor) -> Dict[str, torch.Tensor]:
+        z = torch.cat([X, mvec], dim=1)
+        if self.ff is not None:
+            z = self.ff(z)
+        h = self.trunk(z)
+        out: Dict[str, torch.Tensor] = {"T": sigmoid01(self.head_T(h))}
+        if self.head_phi is not None:
+            out["phi"] = sigmoid01(self.head_phi(h))
+        return out
+
+
+class ControlNet(nn.Module):
+    def __init__(self, dim: int, mat_dim: int, hidden: int, depth: int):
+        super().__init__()
+        self.boundary_net = MLP((dim + 1) + dim + mat_dim, hidden, depth, 1, dropout=0.0)
+
+    def boundary(self, Xb: torch.Tensor, nb: torch.Tensor, mvec: torch.Tensor, budget: float) -> torch.Tensor:
+        inp = torch.cat([Xb, nb, mvec], dim=1)
+        return budget * torch.tanh(self.boundary_net(inp))
+
+
+# ============================================================
+# Autograd helpers
+# ============================================================
+def _grad(outputs: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
+    return torch.autograd.grad(
+        outputs=outputs,
+        inputs=inputs,
+        grad_outputs=torch.ones_like(outputs),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+
+
+def grad_scalar(y: torch.Tensor, X: torch.Tensor, dim: int) -> torch.Tensor:
+    return _grad(y, X)[:, :dim]
+
+
+def dt_scalar(y: torch.Tensor, X: torch.Tensor, dim: int) -> torch.Tensor:
+    return _grad(y, X)[:, dim:dim+1]
+
+
+def div_vector(v: torch.Tensor, X: torch.Tensor, dim: int) -> torch.Tensor:
+    div = 0.0
+    for i in range(dim):
+        div = div + _grad(v[:, i:i+1], X)[:, i:i+1]
+    return div
+
+
+# ============================================================
+# Sources + samplers
+# ============================================================
+def source_Sp(X: torch.Tensor, dim: int) -> torch.Tensor:
+    x = X[:, :dim]
+    t = X[:, dim:dim+1]
+    xc = 0.5 * torch.ones_like(x)
+    r2 = torch.sum((x - xc) ** 2, dim=1, keepdim=True)
+    pulse = torch.exp(-80.0 * r2) * torch.exp(-60.0 * (t - 0.2) ** 2)
+    return 0.5 * pulse
+
+
+def sample_interior(n: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    return torch.rand(n, dim + 1, device=device, dtype=dtype)
+
+
+def sample_initial(n: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    X = torch.rand(n, dim + 1, device=device, dtype=dtype)
+    X[:, dim] = 0.0
+    return X
+
+
+def sample_boundary(n: int, dim: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+    per_face = max(1, n // (2 * dim))
+    X_list, N_list = [], []
+
+    def rand_xt(m: int) -> torch.Tensor:
+        return torch.rand(m, dim + 1, device=device, dtype=dtype)
+
+    count = 0
+    for i in range(dim):
+        X0 = rand_xt(per_face); X0[:, i] = 0.0
+        n0 = torch.zeros(per_face, dim, device=device, dtype=dtype); n0[:, i] = -1.0
+        X_list.append(X0); N_list.append(n0); count += per_face
+
+        X1 = rand_xt(per_face); X1[:, i] = 1.0
+        n1 = torch.zeros(per_face, dim, device=device, dtype=dtype); n1[:, i] = 1.0
+        X_list.append(X1); N_list.append(n1); count += per_face
+
+    rem = n - count
+    if rem > 0:
+        Xr = rand_xt(rem)
+        face_dim = torch.randint(0, dim, (rem,), device=device)
+        face_side = torch.randint(0, 2, (rem,), device=device)
+        nr = torch.zeros(rem, dim, device=device, dtype=dtype)
+        for k in range(rem):
+            i = int(face_dim[k].item())
+            side = int(face_side[k].item())
+            Xr[k, i] = float(side)
+            nr[k, i] = -1.0 if side == 0 else 1.0
+        X_list.append(Xr); N_list.append(nr)
+
+    Xb = torch.cat(X_list, dim=0)
+    nb = torch.cat(N_list, dim=0)
+    idx = torch.randperm(Xb.shape[0], device=device)
+    return Xb[idx], nb[idx]
+
+
+def sample_time_slices(n_space: int, times: torch.Tensor, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    n_times = times.numel()
+    X = torch.rand(n_space * n_times, dim + 1, device=device, dtype=dtype)
+    for i in range(n_times):
+        X[i * n_space:(i + 1) * n_space, dim] = times[i]
+    return X
+
+
+def sample_scenario_batch_interior(mat: MaterialModel, n_scenarios: int, n_total: int, dim: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+    n_each = max(1, n_total // n_scenarios)
+    m_s = mat.sample_material_vector(n_scenarios)
+    Xs = []
+    ms = []
+    for s in range(n_scenarios):
+        X = sample_interior(n_each, dim, device, dtype)
+        Xs.append(X)
+        ms.append(m_s[s:s+1].repeat(n_each, 1))
+    return torch.cat(Xs, dim=0), torch.cat(ms, dim=0)
+
+
+def sample_scenario_batch_boundary(mat: MaterialModel, n_scenarios: int, n_total: int, dim: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    n_each = max(1, n_total // n_scenarios)
+    m_s = mat.sample_material_vector(n_scenarios)
+    Xs = []
+    Ns = []
+    ms = []
+    for s in range(n_scenarios):
+        Xb, nb = sample_boundary(n_each, dim, device, dtype)
+        Xs.append(Xb)
+        Ns.append(nb)
+        ms.append(m_s[s:s+1].repeat(Xb.shape[0], 1))
+    return torch.cat(Xs, dim=0), torch.cat(Ns, dim=0), torch.cat(ms, dim=0)
+
+
+def sample_scenario_batch_initial(mat: MaterialModel, n_scenarios: int, n_total: int, dim: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+    n_each = max(1, n_total // n_scenarios)
+    m_s = mat.sample_material_vector(n_scenarios)
+    Xs = []
+    ms = []
+    for s in range(n_scenarios):
+        X0 = sample_initial(n_each, dim, device, dtype)
+        Xs.append(X0)
+        ms.append(m_s[s:s+1].repeat(X0.shape[0], 1))
+    return torch.cat(Xs, dim=0), torch.cat(ms, dim=0)
+
+
+def sample_scenario_time_slices(mat: MaterialModel, n_scenarios: int, n_space: int, times: torch.Tensor, dim: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+    m_s = mat.sample_material_vector(n_scenarios)
+    Xs = []
+    ms = []
+    for s in range(n_scenarios):
+        Xt = sample_time_slices(n_space, times, dim, device, dtype)
+        Xs.append(Xt)
+        ms.append(m_s[s:s+1].repeat(Xt.shape[0], 1))
+    return torch.cat(Xs, dim=0), torch.cat(ms, dim=0)
+
+
+# ============================================================
+# Setpoints / ambient
+# ============================================================
+def T_inf(t: torch.Tensor) -> torch.Tensor:
+    return 0.2 + 0.05 * torch.sin(2.0 * math.pi * t)
+
+
+def setpoint_t(t: torch.Tensor, targets: Targets, physics: PhysicsConfig) -> torch.Tensor:
+    mode = physics.track_setpoint_mode.lower()
+    if mode == "ambient":
+        return T_inf(t)
+    return torch.full_like(t, float(targets.T_set))
+
+
+# ============================================================
+# Physics residuals
+# ============================================================
+def compute_q_fourier(T: torch.Tensor, props: Dict[str, torch.Tensor], X: torch.Tensor, dim: int) -> torch.Tensor:
+    K = props["K_star"]
+    return -K * grad_scalar(T, X, dim)
+
+
+def phase_equilibrium(T: torch.Tensor, Tm_star: torch.Tensor, physics: PhysicsConfig) -> torch.Tensor:
+    return torch.sigmoid(float(physics.phase_beta) * (T - Tm_star))
+
+
+def loss_phase_consistency(out: Dict[str, torch.Tensor], props: Dict[str, torch.Tensor], X: torch.Tensor, dim: int, physics: PhysicsConfig) -> torch.Tensor:
+    mode = physics.phase_mode.lower()
+    if mode == "none" or ("phi" not in out):
+        return torch.tensor(0.0, device=X.device, dtype=X.dtype)
+
+    phi = out["phi"]
+    if mode == "pcm_equilibrium":
+        phi_eq = phase_equilibrium(out["T"], props["Tm_star"], physics)
+        L_eq = torch.mean((phi - phi_eq) ** 2)
+    else:  # "damage"
+        L_eq = torch.mean(phi ** 2)
+
+    gphi = grad_scalar(phi, X, dim)
+    L_smooth = torch.mean(torch.sum(gphi**2, dim=1, keepdim=True))
+    return L_eq + float(physics.phase_smooth_grad_w) * L_smooth
+
+
+def residual_energy(out: Dict[str, torch.Tensor], props: Dict[str, torch.Tensor], X: torch.Tensor, dim: int, physics: PhysicsConfig) -> torch.Tensor:
+    """
+    C_hat dT/dt + div(q) + latent - source = 0
+    latent is only used for PCM equilibrium mode (enthalpy proxy).
+    """
+    T = out["T"]
+    dTdt = dt_scalar(T, X, dim)
+    q = compute_q_fourier(T, props, X, dim)
+    divq = div_vector(q, X, dim)
+
+    latent = 0.0
+    if physics.phase_mode.lower() == "pcm_equilibrium" and ("phi" in out):
+        latent = (1.0 / (props["Ste"] + 1e-12)) * dt_scalar(out["phi"], X, dim)
+
+    rhs = source_Sp(X, dim) if physics.use_sources else torch.zeros_like(dTdt)
+    return props["C_hat"] * dTdt + latent + divq - rhs
+
+
+# ============================================================
+# BC / IC
+# ============================================================
+def residual_bc(out_b: Dict[str, torch.Tensor], props_b: Dict[str, torch.Tensor], Xb: torch.Tensor, nb: torch.Tensor, dim: int, physics: PhysicsConfig, q_ctrl: Optional[torch.Tensor]) -> torch.Tensor:
+    T = out_b["T"]
+    q = compute_q_fourier(T, props_b, Xb, dim)
+    flux_n = -torch.sum(q * nb, dim=1, keepdim=True)
+
+    t = Xb[:, dim:dim+1]
+    Tinf = T_inf(t)
+
+    bc = physics.bc_type.lower()
+    if bc == "dirichlet":
+        return T - Tinf
+
+    if bc == "neumann":
+        qN = 0.05 * torch.sin(2 * math.pi * t)
+        if q_ctrl is not None:
+            qN = qN + q_ctrl
+        return flux_n - qN
+
+    Bi_c = props_b["Bi_c"]
+    eps = props_b["eps"]
+    Bi_r = 0.02 * eps
+    q_in = 0.05 * torch.sin(2 * math.pi * t)
+    q_total = q_in + (q_ctrl if q_ctrl is not None else 0.0)
+    rhs = Bi_c * (T - Tinf) + Bi_r * (T**4 - Tinf**4) + q_total
+    return flux_n - rhs
+
+
+def residual_ic(out0: Dict[str, torch.Tensor], X0: torch.Tensor, physics: PhysicsConfig) -> torch.Tensor:
+    T = out0["T"]
+    res = [T - torch.full_like(T, 0.2)]
+    if physics.phase_mode.lower() != "none" and ("phi" in out0):
+        res.append(out0["phi"] - torch.zeros_like(out0["phi"]))
+    return torch.cat(res, dim=1)
+
+
+# ============================================================
+# Regularizers / efficiencies
+# ============================================================
+def entropy_production(out: Dict[str, torch.Tensor], props: Dict[str, torch.Tensor], X: torch.Tensor, dim: int) -> torch.Tensor:
+    T = out["T"]
+    gT = grad_scalar(T, X, dim)
+    K = props["K_star"].clamp(min=1e-12)
+    sigma = K * torch.sum(gT**2, dim=1, keepdim=True) / (T.clamp(min=1e-3) ** 2)
+    return torch.mean(sigma)
+
+
+def bounds_penalty(out: Dict[str, torch.Tensor]) -> torch.Tensor:
+    T = out["T"]
+    pen = torch.mean(torch.relu(T - 1.0) ** 2 + torch.relu(0.0 - T) ** 2)
+    if "phi" in out:
+        phi = out["phi"]
+        pen = pen + torch.mean(torch.relu(phi - 1.0) ** 2 + torch.relu(0.0 - phi) ** 2)
+    return pen
+
+
+def priors_penalty(props: Dict[str, torch.Tensor]) -> torch.Tensor:
+    return (
+        torch.mean(torch.relu(props["Theta_q"] - 1.0) ** 2)
+        + torch.mean(torch.relu(props["Lambda_q"] - 0.2) ** 2)
+        + 1e-4 * torch.mean(torch.relu(props["Bi_c"] - 50.0) ** 2)
+    )
+
+
+def eta_rational(x: float, target: float, p: float = 2.0) -> float:
+    if target <= 0:
+        return 1.0
+    r = x / (target + 1e-12)
+    return float(1.0 / (1.0 + (r ** p)))
+
+
+def eta_cap_ratio(x: float, target: float) -> float:
+    if target <= 0:
+        return 1.0
+    return float(min(1.0, x / target))
+
+
+def eta_gaussian(x: float, mu: float, sigma: float) -> float:
+    if sigma <= 0:
+        return 1.0 if abs(x - mu) < 1e-12 else 0.0
+    z = (x - mu) / sigma
+    return float(math.exp(-(z * z)))
+
+
+def geom_mean(vals: List[float]) -> float:
+    prod = 1.0
+    for v in vals:
+        prod *= max(1e-12, min(1.0, float(v)))
+    return float(prod ** (1.0 / len(vals))) if vals else 0.0
+
+
+# ============================================================
+# RAR
+# ============================================================
+@torch.no_grad()
+def _select_rar_indices(residual_abs: torch.Tensor, top_frac: float) -> torch.Tensor:
+    r = residual_abs.view(-1)
+    k = max(1, int(top_frac * r.numel()))
+    _, idx = torch.topk(r, k=k, largest=True, sorted=False)
+    return idx
+
+
+def build_rar_pool(dim: int, pool: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    return sample_interior(pool, dim, device, dtype)
+
+
+# ============================================================
+# Metrics (grad enabled)
+# ============================================================
+def evaluate_metrics(
+    model: MultiFieldPINN,
+    ctrl: Optional[ControlNet],
+    mat: MaterialModel,
+    physics: PhysicsConfig,
+    nd_cfg: NondimConfig,
+    targets: Targets,
+    n_eval_scenarios: int,
+    n_space: int,
+    times: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+    sps: float,
+    mem_gb: float,
+) -> Dict[str, float]:
+    dim = physics.dim
+    model.eval()
+    if ctrl is not None:
+        ctrl.eval()
+
+    with torch.enable_grad():
+        X, mvec = sample_scenario_time_slices(mat, n_eval_scenarios, n_space, times, dim, device, dtype)
+        X.requires_grad_(True)
+        out = model(X, mvec)
+        out = {k: v.float() for k, v in out.items()}
+        props = mat.eval(out["T"], out.get("phi", None), mvec, nd_cfg)
+
+        rE = residual_energy(out, props, X, dim, physics)
+        E1_rms = float(torch.sqrt(torch.mean(rE**2)).item())
+
+        ent = float(entropy_production(out, props, X, dim).item())
+
+        # reshape: (S, T, N, 1)
+        S = n_eval_scenarios
+        Tn = times.numel()
+        N = n_space
+        Tfield = out["T"].view(S, Tn, N, 1)
+        T_mean = Tfield.mean(dim=2).squeeze(-1)  # (S,T)
+        T_std = Tfield.std(dim=2).squeeze(-1)    # (S,T)
+
+        # setpoint per time
+        tcol = times.view(1, Tn).repeat(S, 1)
+        sp = setpoint_t(tcol, targets, physics)
+
+        rmse_mean = float(torch.sqrt(torch.mean((T_mean - sp) ** 2)).item())
+        tol = float(targets.band_frac * max(abs(targets.T_set), 1e-6))
+        frac_in_band = float(((T_mean - sp).abs() <= tol).float().mean().item())
+
+        CV_T = float(torch.mean(T_std / (T_mean.abs() + 1e-12)).item())
+
+        gT = grad_scalar(out["T"], X, dim)
+        grad_rms = float(torch.sqrt(torch.mean(torch.sum(gT**2, dim=1))).item())
+        diss = float(torch.mean(props["K_star"] * torch.sum(gT**2, dim=1, keepdim=True)).item())
+
+        k_eff_star = float(torch.mean(props["K_star"]).item())
+        k_eff_phys = float(k_eff_star * nd_cfg.k_ref)
+
+        phi_mean = 0.0
+        latent_ratio = 0.0
+        eta_lat = 1.0
+        if physics.phase_mode.lower() == "pcm_equilibrium" and ("phi" in out):
+            phi = out["phi"]
+            phi_mean = float(phi.mean().item())
+            dphidt = dt_scalar(phi, X, dim)
+            latent_term = (1.0 / (props["Ste"] + 1e-12)) * dphidt
+            latent_power = float(torch.mean(torch.abs(latent_term)).item())
+            src = source_Sp(X, dim) if physics.use_sources else torch.zeros_like(latent_term)
+            src_power = float(torch.mean(torch.abs(src)).item())
+            latent_ratio = float(latent_power / (latent_power + src_power + 1e-12))
+            eta_lat = eta_gaussian(latent_ratio, targets.latent_ratio_target, targets.latent_ratio_sigma)
+
+        ctrl_rms = 0.0
+        if physics.use_control and ctrl is not None and physics.control_boundary:
+            Xb, nb, mb = sample_scenario_batch_boundary(mat, n_eval_scenarios, min(4096, n_eval_scenarios * 1024), dim, device, dtype)
+            q_ctrl = ctrl.boundary(Xb, nb, mb, physics.control_budget_q).float()
+            ctrl_rms = float(torch.sqrt(torch.mean(q_ctrl**2)).item())
+
+        eta_phys = eta_rational(E1_rms, targets.E1rms_target, p=2.0)
+        eta_cmp = eta_cap_ratio(sps, targets.sps_target)
+        eta_mem = eta_rational(mem_gb, targets.mem_gb_target, p=2.0)
+        eta_sim = geom_mean([eta_phys, eta_cmp, eta_mem])
+
+        eta_stab = eta_cap_ratio(frac_in_band, targets.frac_in_band_target)
+        eta_trk = eta_rational(rmse_mean, targets.rmse_set_target, p=2.0)
+        eta_ctrl = geom_mean([eta_stab, eta_trk, eta_phys, eta_cmp])
+
+        eta_entropy = eta_rational(ent, targets.entropy_target, p=2.0)
+        eta_uniform = eta_rational(CV_T, targets.CV_T_target, p=2.0)
+        eta_grad = eta_rational(grad_rms, targets.grad_rms_target, p=2.0)
+        eta_diss = eta_rational(diss, targets.dissipation_target, p=2.0)
+
+    return {
+        "E1_rms": E1_rms,
+        "entropy_proxy": ent,
+        "rmse_mean": rmse_mean,
+        "frac_in_band_mean": frac_in_band,
+        "CV_T": CV_T,
+        "grad_rms": grad_rms,
+        "dissipation": diss,
+        "k_eff_phys_est": k_eff_phys,
+        "phi_mean": phi_mean,
+        "latent_ratio": latent_ratio,
+        "ctrl_rms": ctrl_rms,
+        "sps": float(sps),
+        "mem_gb": float(mem_gb),
+        "eta_physics": eta_phys,
+        "eta_compute": eta_cmp,
+        "eta_memory": eta_mem,
+        "eta_sim_core": eta_sim,
+        "eta_control_core": eta_ctrl,
+        "eta_stability": eta_stab,
+        "eta_tracking": eta_trk,
+        "eta_entropy": eta_entropy,
+        "eta_uniformity": eta_uniform,
+        "eta_gradient": eta_grad,
+        "eta_dissipation": eta_diss,
+        "eta_latent": float(eta_lat),
+    }
+
+
+# ============================================================
+# Training
+# ============================================================
+def train_unified(
+    physics: PhysicsConfig,
+    nd_cfg: NondimConfig,
+    mat_cfg: MaterialConfig,
+    net_cfg: NetConfig,
+    tr_cfg: TrainConfig,
+    targets: Targets,
+):
+    device = get_device()
+    dtype = torch.float32
+    configure_torch_for_speed(tr_cfg.seed, deterministic=tr_cfg.deterministic)
+
+    nd = Nondim(nd_cfg)
+    mat = MaterialModel(mat_cfg, nd, device, dtype)
+
+    mat_dim = mat_cfg.base_vec_dim + (mat_cfg.micro_vec_dim if mat_cfg.use_microstructure else 0)
+    model = MultiFieldPINN(physics.dim, mat_dim, net_cfg, physics, device, dtype).to(device)
+
+    ctrl = None
+    if physics.use_control and physics.control_boundary:
+        ctrl = ControlNet(physics.dim, mat_dim, hidden=max(64, net_cfg.hidden // 2), depth=max(3, net_cfg.depth // 2)).to(device)
+
+    model = maybe_compile(model, enabled=tr_cfg.compile_model)
+    if ctrl is not None:
+        ctrl = maybe_compile(ctrl, enabled=tr_cfg.compile_model)
+
+    params = list(model.parameters()) + (list(ctrl.parameters()) if ctrl is not None else [])
+    try:
+        opt = optim.AdamW(params, lr=tr_cfg.lr, weight_decay=tr_cfg.weight_decay, fused=(device.type == "cuda"))
+    except TypeError:
+        opt = optim.AdamW(params, lr=tr_cfg.lr, weight_decay=tr_cfg.weight_decay)
+
+    scheduler = None
+    if tr_cfg.use_scheduler:
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode="min", factor=tr_cfg.sched_factor, patience=tr_cfg.sched_patience, min_lr=tr_cfg.sched_min_lr
+        )
+
+    amp_enabled = (device.type == "cuda" and tr_cfg.use_amp)
+    amp_dtype = torch.bfloat16 if tr_cfg.amp_dtype.lower() == "bf16" else torch.float16
+    scaler = make_scaler(device, enabled=amp_enabled)
+
+    log = Logger(tr_cfg.out_dir, tr_cfg.run_name)
+    log.log_meta("version", VERSION_TAG)
+    log.log_meta("python", platform.python_version())
+    log.log_meta("torch", torch.__version__)
+    log.log_meta("device", str(device))
+    ok, reason = can_use_torch_compile()
+    log.log_meta("compile_capability", {"ok": ok, "reason": reason})
+    log.log_meta("physics", asdict(physics))
+    log.log_meta("nondim", asdict(nd_cfg))
+    log.log_meta("material", asdict(mat_cfg))
+    log.log_meta("net", asdict(net_cfg))
+    log.log_meta("train", asdict(tr_cfg))
+    log.log_meta("targets", asdict(targets))
+
+    def pde_ramp(epoch: int) -> float:
+        if not tr_cfg.curriculum:
+            return 1.0
+        return min(1.0, epoch / max(1, tr_cfg.curriculum_epochs))
+
+    stage1_end = max(1, int(tr_cfg.stage1_frac * tr_cfg.epochs))
+
+    def reg_ramp(epoch: int) -> float:
+        if epoch <= stage1_end:
+            return 0.0
+        return min(1.0, (epoch - stage1_end) / max(1, tr_cfg.reg_ramp_epochs))
+
+    rar_pool_X = build_rar_pool(physics.dim, tr_cfg.rar_pool, device, dtype) if tr_cfg.use_rar else None
+    rar_top_idx = None
+
+    last_log_time = time.time()
+    steps_since_log = 0
+    success_streak = 0
+    dim = physics.dim
+
+    track_times = torch.tensor(list(tr_cfg.track_times), device=device, dtype=dtype)
+
+    for epoch in range(1, tr_cfg.epochs + 1):
+        model.train()
+        if ctrl is not None:
+            ctrl.train()
+
+        curr_pde = pde_ramp(epoch)
+        reg = reg_ramp(epoch)
+
+        # --- scenario-coherent batches ---
+        Xi, m_i = sample_scenario_batch_interior(mat, tr_cfg.n_scenarios, tr_cfg.n_interior, dim, device, dtype)
+        Xb, nb, m_b = sample_scenario_batch_boundary(mat, tr_cfg.n_scenarios, tr_cfg.n_boundary, dim, device, dtype)
+        X0, m_0 = sample_scenario_batch_initial(mat, tr_cfg.n_scenarios, tr_cfg.n_initial, dim, device, dtype)
+
+        Xi.requires_grad_(True)
+        Xb.requires_grad_(True)
+        X0.requires_grad_(True)
+
+        with autocast_ctx(device, enabled=amp_enabled, dtype=amp_dtype):
+            out_i_raw = model(Xi, m_i)
+            out_b_raw = model(Xb, m_b)
+            out_0_raw = model(X0, m_0)
+
+            q_ctrl_raw = None
+            if physics.use_control and ctrl is not None and physics.control_boundary:
+                q_ctrl_raw = ctrl.boundary(Xb, nb, m_b, physics.control_budget_q)
+
+        out_i = {k: v.float() for k, v in out_i_raw.items()}
+        out_b = {k: v.float() for k, v in out_b_raw.items()}
+        out_0 = {k: v.float() for k, v in out_0_raw.items()}
+        q_ctrl = q_ctrl_raw.float() if q_ctrl_raw is not None else None
+
+        props_i = mat.eval(out_i["T"], out_i.get("phi", None), m_i, nd_cfg)
+        props_b = mat.eval(out_b["T"], out_b.get("phi", None), m_b, nd_cfg)
+
+        # PDE + BC + IC
+        rE = residual_energy(out_i, props_i, Xi, dim, physics)
+        Lpde = torch.mean(rE**2)
+
+        Lphase = loss_phase_consistency(out_i, props_i, Xi, dim, physics)
+
+        rbc = residual_bc(out_b, props_b, Xb, nb, dim, physics, q_ctrl=q_ctrl)
+        Lbc = torch.mean(rbc**2)
+
+        ric = residual_ic(out_0, X0, physics)
+        Lic = torch.mean(ric**2)
+
+        # regularizers
+        Lent = entropy_production(out_i, props_i, Xi, dim)
+        Lbnd = bounds_penalty(out_i)
+        Lpri = priors_penalty(props_i)
+
+        # --- time-sliced regulation (aligned with evaluation) ---
+        # Build a small tracking batch per scenario (no derivatives needed)
+        Xt, mt = sample_scenario_time_slices(mat, tr_cfg.n_scenarios, tr_cfg.n_track_space, track_times, dim, device, dtype)
+        with autocast_ctx(device, enabled=amp_enabled, dtype=amp_dtype):
+            out_t_raw = model(Xt, mt)
+        out_t = {k: v.float() for k, v in out_t_raw.items()}
+
+        S = tr_cfg.n_scenarios
+        Tn = track_times.numel()
+        N = tr_cfg.n_track_space
+        Tfield = out_t["T"].view(S, Tn, N, 1)
+        T_mean = Tfield.mean(dim=2).squeeze(-1)  # (S,T)
+
+        tcol = track_times.view(1, Tn).repeat(S, 1)
+        sp = setpoint_t(tcol, targets, physics)
+
+        tol = float(targets.band_frac * max(abs(targets.T_set), 1e-6))
+
+        # mean tracking / band
+        Ltrack = torch.mean((T_mean - sp) ** 2)
+        Lband = torch.mean(torch.relu(torch.abs(T_mean - sp) - tol) ** 2)
+
+        # uniformity (encourage low variance at each time)
+        Luni = torch.mean(Tfield.var(dim=2))
+
+        # control penalty
+        Lctrl = torch.tensor(0.0, device=device)
+        if q_ctrl is not None:
+            Lctrl = torch.mean(q_ctrl**2)
+
+        # effective weights (ramped)
+        w_track = reg * tr_cfg.w_track
+        w_band = reg * tr_cfg.w_band
+        w_uni = reg * tr_cfg.w_uniformity
+
+        total = (
+            tr_cfg.w_pde * (curr_pde * Lpde)
+            + tr_cfg.w_phase * Lphase
+            + tr_cfg.w_bc * Lbc
+            + tr_cfg.w_ic * Lic
+            + tr_cfg.w_entropy * Lent
+            + tr_cfg.w_bounds * Lbnd
+            + tr_cfg.w_priors * Lpri
+            + w_track * Ltrack
+            + w_band * Lband
+            + w_uni * Luni
+            + tr_cfg.w_ctrl * Lctrl
+        )
+
+        opt.zero_grad(set_to_none=True)
+        scaler.scale(total).backward()
+
+        if tr_cfg.grad_clip and tr_cfg.grad_clip > 0:
+            scaler.unscale_(opt)
+            nn.utils.clip_grad_norm_(params, tr_cfg.grad_clip)
+
+        scaler.step(opt)
+        scaler.update()
+
+        steps_since_log += 1
+
+        # RAR update (single pool)
+        if tr_cfg.use_rar and rar_pool_X is not None and (epoch % tr_cfg.rar_every == 0):
+            model.eval()
+            with torch.enable_grad():
+                Xp = rar_pool_X
+                mp = mat.sample_material_vector(Xp.shape[0])
+                Xp_req = Xp.detach().clone().requires_grad_(True)
+                outp = model(Xp_req, mp)
+                outp = {k: v.float() for k, v in outp.items()}
+                propsp = mat.eval(outp["T"], outp.get("phi", None), mp, nd_cfg)
+                rEp = residual_energy(outp, propsp, Xp_req, dim, physics)
+                rar_top_idx = _select_rar_indices(torch.abs(rEp).detach(), tr_cfg.rar_top_frac)
+
+        # Logging
+        if epoch % tr_cfg.log_every == 0 or epoch == 1:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+
+            now = time.time()
+            dt_train = max(now - last_log_time, 1e-12)
+            sps = float((steps_since_log * tr_cfg.n_interior) / dt_train)
+            last_log_time = time.time()
+            steps_since_log = 0
+
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats()
+            mem_gb = compute_gpu_mem_gb()
+
+            times_eval = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0], device=device, dtype=dtype)
+            metrics = evaluate_metrics(
+                model=model,
+                ctrl=ctrl,
+                mat=mat,
+                physics=physics,
+                nd_cfg=nd_cfg,
+                targets=targets,
+                n_eval_scenarios=2,
+                n_space=512,
+                times=times_eval,
+                device=device,
+                dtype=dtype,
+                sps=sps,
+                mem_gb=mem_gb
+            )
+
+            row = {
+                "epoch": float(epoch),
+                "loss_total": float(total.item()),
+                "Lpde": float(Lpde.item()),
+                "Lbc": float(Lbc.item()),
+                "Lic": float(Lic.item()),
+                "Lphase": float(Lphase.item()),
+                "Ltrack": float(Ltrack.item()),
+                "Lband": float(Lband.item()),
+                "Luni": float(Luni.item()),
+                "Lctrl": float(Lctrl.item()),
+                "curr_pde": float(curr_pde),
+                "reg": float(reg),
+                "lr": float(opt.param_groups[0]["lr"]),
+                **{k: float(v) for k, v in metrics.items()},
+            }
+            log.log_row(row)
+
+            print(
+                f"[{epoch}/{tr_cfg.epochs}] "
+                f"loss={row['loss_total']:.3e} pde={row['Lpde']:.3e} bc={row['Lbc']:.2e} ic={row['Lic']:.2e} "
+                f"trk={row['Ltrack']:.2e} band={row['Lband']:.2e} uni={row['Luni']:.2e} "
+                f"E1rms={row['E1_rms']:.2e} rmseμ={row['rmse_mean']:.2e} fracμ={row['frac_in_band_mean']:.2f} "
+                f"CV={row['CV_T']:.2e} phī={row['phi_mean']:.3f} lat={row['latent_ratio']:.3f} η_lat={row['eta_latent']:.2f} "
+                f"k_eff≈{row['k_eff_phys_est']:.1f}W/mK sps={row['sps']:.0f} η_sim={row['eta_sim_core']:.3f} η_ctrl={row['eta_control_core']:.3f}"
+            )
+
+            if scheduler is not None:
+                scheduler.step(row["loss_total"])
+
+            meets = (
+                (epoch >= tr_cfg.early_stop_min_epoch)
+                and (row["eta_sim_core"] >= targets.eta_total_sim_target)
+                and (row["eta_control_core"] >= targets.eta_total_control_target)
+                and (row["E1_rms"] <= 2.0 * targets.E1rms_target)
+            )
+            success_streak = success_streak + 1 if (tr_cfg.early_stop and meets) else 0
+            if tr_cfg.early_stop and success_streak >= tr_cfg.early_stop_patience_logs:
+                print("Early stopping: sim+control targets satisfied.")
+                break
+
+    # Optional L-BFGS refinement (helps drive PDE residual down)
+    if tr_cfg.use_lbfgs_refine and tr_cfg.lbfgs_steps > 0:
+        print("Starting L-BFGS refinement...")
+        model.train()
+        if ctrl is not None:
+            ctrl.train()
+
+        lbfgs = optim.LBFGS(
+            list(model.parameters()) + (list(ctrl.parameters()) if ctrl is not None else []),
+            lr=1.0,
+            max_iter=tr_cfg.lbfgs_steps,
+            history_size=50,
+            line_search_fn="strong_wolfe"
+        )
+
+        Xi, m_i = sample_scenario_batch_interior(mat, tr_cfg.n_scenarios, tr_cfg.n_interior, dim, device, dtype)
+        Xb, nb, m_b = sample_scenario_batch_boundary(mat, tr_cfg.n_scenarios, tr_cfg.n_boundary, dim, device, dtype)
+        X0, m_0 = sample_scenario_batch_initial(mat, tr_cfg.n_scenarios, tr_cfg.n_initial, dim, device, dtype)
+        Xi.requires_grad_(True)
+        Xb.requires_grad_(True)
+        X0.requires_grad_(True)
+
+        track_times = torch.tensor(list(tr_cfg.track_times), device=device, dtype=dtype)
+        Xt, mt = sample_scenario_time_slices(mat, tr_cfg.n_scenarios, tr_cfg.n_track_space, track_times, dim, device, dtype)
+
+        def closure():
+            lbfgs.zero_grad(set_to_none=True)
+
+            out_i = model(Xi, m_i)
+            out_b = model(Xb, m_b)
+            out_0 = model(X0, m_0)
+            out_t = model(Xt, mt)
+
+            out_i = {k: v.float() for k, v in out_i.items()}
+            out_b = {k: v.float() for k, v in out_b.items()}
+            out_0 = {k: v.float() for k, v in out_0.items()}
+            out_t = {k: v.float() for k, v in out_t.items()}
+
+            q_ctrl = None
+            if physics.use_control and ctrl is not None and physics.control_boundary:
+                q_ctrl = ctrl.boundary(Xb, nb, m_b, physics.control_budget_q).float()
+
+            props_i = mat.eval(out_i["T"], out_i.get("phi", None), m_i, nd_cfg)
+            props_b = mat.eval(out_b["T"], out_b.get("phi", None), m_b, nd_cfg)
+
+            rE = residual_energy(out_i, props_i, Xi, dim, physics)
+            Lpde = torch.mean(rE**2)
+            Lphase = loss_phase_consistency(out_i, props_i, Xi, dim, physics)
+            rbc = residual_bc(out_b, props_b, Xb, nb, dim, physics, q_ctrl=q_ctrl)
+            Lbc = torch.mean(rbc**2)
+            ric = residual_ic(out_0, X0, physics)
+            Lic = torch.mean(ric**2)
+
+            # time-sliced tracking
+            S = tr_cfg.n_scenarios
+            Tn = track_times.numel()
+            N = tr_cfg.n_track_space
+            Tfield = out_t["T"].view(S, Tn, N, 1)
+            T_mean = Tfield.mean(dim=2).squeeze(-1)
+            tcol = track_times.view(1, Tn).repeat(S, 1)
+            sp = setpoint_t(tcol, targets, physics)
+            tol = float(targets.band_frac * max(abs(targets.T_set), 1e-6))
+            Ltrack = torch.mean((T_mean - sp) ** 2)
+            Lband = torch.mean(torch.relu(torch.abs(T_mean - sp) - tol) ** 2)
+            Luni = torch.mean(Tfield.var(dim=2))
+
+            Lent = entropy_production(out_i, props_i, Xi, dim)
+            Lbnd = bounds_penalty(out_i)
+            Lpri = priors_penalty(props_i)
+
+            Lctrl = torch.tensor(0.0, device=device)
+            if q_ctrl is not None:
+                Lctrl = torch.mean(q_ctrl**2)
+
+            total = (
+                tr_cfg.w_pde * Lpde
+                + tr_cfg.w_phase * Lphase
+                + tr_cfg.w_bc * Lbc
+                + tr_cfg.w_ic * Lic
+                + tr_cfg.w_entropy * Lent
+                + tr_cfg.w_bounds * Lbnd
+                + tr_cfg.w_priors * Lpri
+                + tr_cfg.w_track * Ltrack
+                + tr_cfg.w_band * Lband
+                + tr_cfg.w_uniformity * Luni
+                + tr_cfg.w_ctrl * Lctrl
+            )
+            total.backward()
+            return total
+
+        lbfgs.step(closure)
+
+    log.save()
+    return model, ctrl, mat, log
+
+
+# ============================================================
+# Design search (microstructure-driven)
+# ============================================================
+def k_eff_score_smooth(k_eff_wmk: float) -> float:
+    return float(math.tanh(k_eff_wmk / 600.0))
+
+
+def design_random_search(
+    model: MultiFieldPINN,
+    mat: MaterialModel,
+    physics: PhysicsConfig,
+    nd_cfg: NondimConfig,
+    targets: Targets,
+    n_candidates: int = 300,
+    n_eval_space: int = 512,
+    times: Optional[List[float]] = None,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+) -> List[Dict[str, Any]]:
+    if not mat.cfg.use_microstructure:
+        raise ValueError("design_random_search requires microstructure enabled.")
+    if device is None:
+        device = get_device()
+
+    dim = physics.dim
+    model.eval()
+
+    times_t = torch.tensor(times if times is not None else [0.2, 0.5, 0.8], device=device, dtype=dtype)
+
+    # Fix base; vary micro only
+    m_base = mat.sample_material_vector(1)
+    base, _ = mat.split_vec(m_base)
+
+    results: List[Dict[str, Any]] = []
+
+    def sample_micro_candidate() -> torch.Tensor:
+        f = torch.empty(1, 1, device=device, dtype=dtype).uniform_(0.0, 0.30)
+        por = torch.empty(1, 1, device=device, dtype=dtype).uniform_(0.0, 0.15)
+        aspect = torch.empty(1, 1, device=device, dtype=dtype).uniform_(5.0, 800.0)
+        orient = torch.empty(1, 1, device=device, dtype=dtype).uniform_(0.0, 1.0)
+        disp = torch.empty(1, 1, device=device, dtype=dtype).uniform_(0.3, 1.0)
+        Rint = torch.empty(1, 1, device=device, dtype=dtype).uniform_(1e-10, 8e-8)
+        return torch.cat([f, por, aspect, orient, disp, Rint], dim=1)
+
+    for _ in range(n_candidates):
+        micro = sample_micro_candidate()
+        m_single = torch.cat([base, micro], dim=1)
+
+        with torch.enable_grad():
+            X = sample_time_slices(n_eval_space, times_t, dim, device, dtype)
+            X.requires_grad_(True)
+            m = m_single.repeat(X.shape[0], 1)
+
+            out = model(X, m)
+            out = {k: v.float() for k, v in out.items()}
+            props = mat.eval(out["T"], out.get("phi", None), m, nd_cfg)
+
+            rE = residual_energy(out, props, X, dim, physics)
+            E1_rms = float(torch.sqrt(torch.mean(rE**2)).item())
+            eta_phys = eta_rational(E1_rms, targets.E1rms_target, p=2.0)
+
+            k_eff_star = float(torch.mean(props["K_star"]).item())
+            k_eff_phys = float(k_eff_star * nd_cfg.k_ref)
+            s_k = k_eff_score_smooth(k_eff_phys)
+
+            gT = grad_scalar(out["T"], X, dim)
+            grad_rms = float(torch.sqrt(torch.mean(torch.sum(gT**2, dim=1))).item())
+            eta_grad = eta_rational(grad_rms, targets.grad_rms_target, p=2.0)
+
+            latent_ratio = 0.0
+            eta_lat = 1.0
+            phi_mean = 0.0
+            if physics.phase_mode.lower() == "pcm_equilibrium" and ("phi" in out):
+                phi = out["phi"]
+                phi_mean = float(phi.mean().item())
+                dphidt = dt_scalar(phi, X, dim)
+                latent_term = (1.0 / (props["Ste"] + 1e-12)) * dphidt
+                latent_power = float(torch.mean(torch.abs(latent_term)).item())
+                src = source_Sp(X, dim) if physics.use_sources else torch.zeros_like(latent_term)
+                src_power = float(torch.mean(torch.abs(src)).item())
+                latent_ratio = float(latent_power / (latent_power + src_power + 1e-12))
+                eta_lat = eta_gaussian(latent_ratio, targets.latent_ratio_target, targets.latent_ratio_sigma)
+
+        w_lat = 0.20 if physics.phase_mode.lower() == "pcm_equilibrium" else 0.00
+        score = float(0.50 * s_k + 0.30 * eta_phys + 0.20 * eta_grad + w_lat * eta_lat)
+
+        results.append({
+            "score": score,
+            "k_eff_phys_est": k_eff_phys,
+            "E1_rms": E1_rms,
+            "grad_rms": grad_rms,
+            "latent_ratio": latent_ratio,
+            "eta_latent": eta_lat,
+            "phi_mean": phi_mean,
+            "micro_vec": micro[0].detach().cpu().numpy().tolist(),
+        })
+
+    results.sort(key=lambda r: float(r["score"]), reverse=True)
+    return results[:10]
+
+
+# ============================================================
+# Optional viz
+# ============================================================
+@torch.no_grad()
+def viz_2d_T(model: MultiFieldPINN, mat: MaterialModel, physics: PhysicsConfig, nd_cfg: NondimConfig, device: torch.device, dtype: torch.dtype, t: float = 0.5, N: int = 120):
+    if not HAS_MPL or physics.dim != 2:
+        return
+    x = torch.linspace(0, 1, N, device=device, dtype=dtype)
+    y = torch.linspace(0, 1, N, device=device, dtype=dtype)
+    Xg, Yg = torch.meshgrid(x, y, indexing="ij")
+    tt = torch.full_like(Xg, float(t))
+    X = torch.cat([Xg.reshape(-1, 1), Yg.reshape(-1, 1), tt.reshape(-1, 1)], dim=1)
+    mvec = mat.sample_material_vector(X.shape[0])
+    out = model(X, mvec)
+    T = out["T"].reshape(N, N).detach().cpu().numpy()
+    plt.figure()
+    plt.imshow(T, origin="lower", extent=[0, 1, 0, 1], aspect="equal")
+    plt.colorbar(label="T*")
+    plt.title(f"2D T*(x,y,t={t})")
+    plt.show()
+
+
+# ============================================================
+# Profiles
+# ============================================================
+def make_profile(profile: str) -> Tuple[PhysicsConfig, NondimConfig, MaterialConfig, NetConfig, TrainConfig, Targets]:
+    profile = profile.lower().strip()
+
+    nd_cfg = NondimConfig()
+    net_cfg = NetConfig()
+    tr_cfg = TrainConfig(run_name=f"phasetropy_v9_{profile}")
+    targets = Targets()
+
+    if profile == "metals_sim":
+        mat_cfg = MaterialConfig(group_name="metals", use_microstructure=True)
+        physics = PhysicsConfig(
+            dim=2,
+            bc_type="robin",
+            use_sources=True,
+            phase_mode="none",
+            use_control=True,
+            control_boundary=True,
+            control_budget_q=0.08,
+            track_setpoint_mode="ambient",
+            track_mean_temperature=True,
+        )
+
+    elif profile == "pcm_latent":
+        mat_cfg = MaterialConfig(group_name="pcm", use_microstructure=True)
+        physics = PhysicsConfig(
+            dim=2,
+            bc_type="robin",
+            use_sources=True,
+            phase_mode="pcm_equilibrium",
+            phase_beta=18.0,
+            use_control=True,
+            control_boundary=True,
+            control_budget_q=0.08,
+            track_setpoint_mode="ambient",
+            track_mean_temperature=True,
+        )
+        targets.T_set = 0.25
+        targets.latent_ratio_target = 0.20
+        targets.latent_ratio_sigma = 0.15
+
+    elif profile == "control_demo":
+        mat_cfg = MaterialConfig(group_name="metals", use_microstructure=True)
+        physics = PhysicsConfig(
+            dim=2,
+            bc_type="robin",
+            use_sources=True,
+            phase_mode="none",
+            use_control=True,
+            control_boundary=True,
+            control_budget_q=0.14,
+            track_setpoint_mode="ambient",
+            track_mean_temperature=True,
+        )
+        tr_cfg.stage1_frac = 0.35
+        tr_cfg.w_track = 28.0
+        tr_cfg.w_band = 40.0
+        tr_cfg.w_uniformity = 2.0
+        tr_cfg.w_ctrl = 0.20
+        targets.rmse_set_target = 0.02
+        targets.frac_in_band_target = 0.85
+
+    else:
+        raise ValueError(f"Unknown profile: {profile}")
+
+    return physics, nd_cfg, mat_cfg, net_cfg, tr_cfg, targets
+
+
+# ============================================================
+# Main
+# ============================================================
+if __name__ == "__main__":
+    PROFILE = "metals_sim"  # "metals_sim" | "pcm_latent" | "control_demo"
+
+    physics, nd_cfg, mat_cfg, net_cfg, tr_cfg, targets = make_profile(PROFILE)
+
+    model, ctrl, mat, logger = train_unified(physics, nd_cfg, mat_cfg, net_cfg, tr_cfg, targets)
+
+    device = get_device()
+    dtype = torch.float32
+    model = model.to(device)
+    if ctrl is not None:
+        ctrl = ctrl.to(device)
+    mat.device = device
+
+    viz_2d_T(model, mat, physics, nd_cfg, device, dtype, t=0.5, N=120)
+
+    print("\nRunning nano-composite design (materials-driven)...")
+    top = design_random_search(
+        model=model,
+        mat=mat,
+        physics=physics,
+        nd_cfg=nd_cfg,
+        targets=targets,
+        n_candidates=300,
+        n_eval_space=512,
+        times=[0.2, 0.5, 0.8],
+        device=device,
+        dtype=dtype,
+    )
+
+    print("\nTOP CANDIDATES (materials-driven):")
+    for i, r in enumerate(top, start=1):
+        print(
+            f"{i:02d} score={r['score']:.3f} "
+            f"k_eff≈{r['k_eff_phys_est']:.1f}W/mK "
+            f"E1rms={r['E1_rms']:.2e} grad_rms={r['grad_rms']:.3f} "
+            f"lat={r['latent_ratio']:.3f} η_lat={r['eta_latent']:.3f} phī={r['phi_mean']:.3f}"
+        )
+
+    os.makedirs(tr_cfg.out_dir, exist_ok=True)
+    with open(os.path.join(tr_cfg.out_dir, f"{tr_cfg.run_name}_top_designs.json"), "w") as f:
+        json.dump(top, f, indent=2)
+
+    print("\nDone.")
